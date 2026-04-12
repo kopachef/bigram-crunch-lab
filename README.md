@@ -285,7 +285,13 @@ go run . -scenarios=false
 - `uniqueWords`: unique selected words divided by total selected words.
 - `repeatWords`: adjacent repeated words divided by total transitions.
 
-A typical run currently looks like this:
+For the values I am currently using in Bigram Crunch, I ran:
+
+```bash
+go run . -sessions 100 -words 120 -search-top 10 -top 0
+```
+
+The output from that local run looked like this:
 
 ```text
 Scenario checks
@@ -297,13 +303,33 @@ one slow but correct bigram        yes     mb should move to the top            
 timing outlier                     yes     a single pause above the timing cap should not change the score before=0.000000 after=0.000000
 greedy indexed selection           yes     exploration should recover more known weak bigrams than greedy indexing greedy recall@10=0.80 explore recall@10=1.00
 
-variant                         recall@10   false+10     meanRank
-miss-heavy-random                    1.00          5         3.00
-balanced-sample                      1.00          5         3.00
-timing-forward-indexed-greedy        0.80          6        20.80
-timing-forward-indexed-explore       1.00          5         3.00
-strict-outlier-indexed-explore       1.00          5         3.00
-fast-confidence-indexed-explore      1.00          5         3.00
+Bigram Crunch scoring simulation
+
+variant                             objective  recall@10   false+10     meanRank    meanScore  uniqueWords  repeatWords
+miss-heavy-random                       91.60       1.00          5         3.00       0.0773         0.01       0.0077
+balanced-sample                         91.71       1.00          5         3.00       0.0976         0.01       0.0018
+timing-forward-indexed-greedy           66.15       0.80          6        19.40       0.0782         0.00       0.0000
+timing-forward-indexed-explore          91.72       1.00          5         3.00       0.1160         0.01       0.0015
+strict-outlier-indexed-explore          91.73       1.00          5         3.00       0.1075         0.01       0.0012
+fast-confidence-indexed-explore         91.71       1.00          5         3.00       0.1128         0.01       0.0021
+
+Parameter search
+
+candidate                           objective  recall@10   false+10     meanRank  uniqueWords  repeatWords
+grid-m0.55-t0.45-c20-max1200-x0.10      91.74       1.00          5         3.00         0.01       0.0003
+grid-m0.55-t0.45-c20-max750-x0.10       91.74       1.00          5         3.00         0.01       0.0003
+grid-m0.55-t0.45-c20-max900-x0.10       91.74       1.00          5         3.00         0.01       0.0003
+grid-m0.55-t0.45-c20-max1500-x0.10      91.74       1.00          5         3.00         0.01       0.0003
+grid-m0.70-t0.30-c10-max750-x0.05       91.74       1.00          5         3.00         0.01       0.0004
+grid-m0.70-t0.30-c10-max900-x0.05       91.74       1.00          5         3.00         0.01       0.0004
+grid-m0.70-t0.30-c10-max1200-x0.05      91.74       1.00          5         3.00         0.01       0.0004
+grid-m0.70-t0.30-c10-max1500-x0.05      91.74       1.00          5         3.00         0.01       0.0004
+grid-m0.60-t0.40-c20-max900-x0.05       91.74       1.00          5         3.00         0.01       0.0005
+grid-m0.60-t0.40-c20-max1200-x0.05      91.74       1.00          5         3.00         0.01       0.0005
+
+Best candidate:
+  grid-m0.55-t0.45-c20-max1200-x0.10
+  objective=91.74 recall@10=1.00 false+10=5 meanRank=3.00 repeatWords=0.0003
 ```
 
 The exact numbers will vary with the seed and flags, but the main observation

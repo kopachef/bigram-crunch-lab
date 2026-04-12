@@ -568,6 +568,10 @@ func (s *Simulator) typeWord(word string, stats map[string]*Stats, variant Varia
 }
 
 func updateStats(all map[string]*Stats, bigram string, correct bool, spacing float64, variant Variant) {
+	if spacing < variant.MinTimingMS || spacing > variant.MaxTimingMS {
+		return
+	}
+
 	stats := all[bigram]
 	if stats == nil {
 		stats = &Stats{}
@@ -579,9 +583,7 @@ func updateStats(all map[string]*Stats, bigram string, correct bool, spacing flo
 	if !correct {
 		stats.Misses++
 	}
-	if spacing >= variant.MinTimingMS && spacing <= variant.MaxTimingMS {
-		stats.AverageMS = movingAverage(stats.AverageMS, spacing, previousAttempts, 50)
-	}
+	stats.AverageMS = movingAverage(stats.AverageMS, spacing, previousAttempts, 50)
 	stats.Score = score(*stats, variant)
 }
 

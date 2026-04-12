@@ -106,10 +106,10 @@ The confidence term is there because I do not want one early mistake to dominate
 the ranking forever. The score is allowed to ramp up as the bigram gets enough
 attempts to be more meaningful.
 
-Timing samples below `minTimingMS` or above `maxTimingMS` are ignored. The
-reason for this is practical rather than theoretical: very small timings and
-large pauses usually say more about input noise or distraction than about a
-specific letter pair.
+Timing samples below `minTimingMS` or above `maxTimingMS` are treated as
+outliers, and the whole bigram update is skipped. The reason for this is
+practical rather than theoretical: very small timings and large pauses usually
+say more about input noise or distraction than about a specific letter pair.
 
 ### Word selection
 
@@ -152,17 +152,17 @@ For each combination, the program runs the same synthetic typing setup and
 computes an objective score. A candidate name like this:
 
 ```text
-grid-m0.55-t0.45-c5-max1200-x0.20
+grid-m0.65-t0.35-c10-max900-x0.05
 ```
 
 means:
 
 ```text
-missWeight = 0.55
-timingWeight = 0.45
-confidenceAttempts = 5
-maxTimingMS = 1200
-explorationRate = 0.20
+missWeight = 0.65
+timingWeight = 0.35
+confidenceAttempts = 10
+maxTimingMS = 900
+explorationRate = 0.05
 ```
 
 The current objective is:
@@ -247,8 +247,8 @@ The current assertion tests cover:
 - confidence should ramp scores up as attempts accumulate
 - scoring weights should control whether misses or timing dominate
 - a slow-but-correct bigram should move to the top
-- a large timing outlier should not change the timing signal
-- timing samples should only affect averages inside the configured bounds
+- a large timing outlier should not change the bigram history
+- timing samples should only update histories inside the configured bounds
 - word scores should use only the top three scored bigrams in a word
 - indexed selection should fall back before any bigram has a score
 - indexed selection should prefer words containing high-scoring bigrams
@@ -269,8 +269,8 @@ program, but they are not a replacement for `go test ./...`:
   top
 - **one slow but correct bigram**: when one bigram is slow but mostly correct,
   it should still rise to the top
-- **timing outlier**: when a timing sample is an obvious pause, it should be
-  ignored
+- **timing outlier**: when a timing sample is an obvious pause, the whole
+  bigram update should be ignored
 - **greedy indexed selection**: when indexed selection is greedy, it can miss
   weak pairs it has not discovered yet
 
@@ -301,7 +301,7 @@ The output from that local run looked like this:
 Scenario checks
 
 scenario                           pass    expected                                               actual
-equal history                      yes     no bigram should materially outrank the others         top=th bottom=mb scoreDelta=0.000000
+equal history                      yes     no bigram should materially outrank the others         top=mb bottom=ng scoreDelta=0.000000
 one missy bigram                   yes     ng should move to the top                              top=ng
 one slow but correct bigram        yes     mb should move to the top                              top=mb
 timing outlier                     yes     a single pause above the timing cap should not change the score before=0.000000 after=0.000000
@@ -310,30 +310,30 @@ greedy indexed selection           yes     exploration should recover more known
 Bigram Crunch scoring simulation
 
 variant                             objective  recall@10   false+10     meanRank    meanScore  uniqueWords  repeatWords
-miss-heavy-random                       91.60       1.00          5         3.00       0.0773         0.01       0.0077
-balanced-sample                         91.71       1.00          5         3.00       0.0976         0.01       0.0018
-timing-forward-indexed-greedy           66.15       0.80          6        19.40       0.0782         0.00       0.0000
-timing-forward-indexed-explore          91.72       1.00          5         3.00       0.1160         0.01       0.0015
-strict-outlier-indexed-explore          91.73       1.00          5         3.00       0.1075         0.01       0.0012
-fast-confidence-indexed-explore         91.71       1.00          5         3.00       0.1128         0.01       0.0021
+miss-heavy-random                       91.60       1.00          5         3.00       0.0774         0.01       0.0077
+balanced-sample                         91.71       1.00          5         3.00       0.0981         0.01       0.0020
+timing-forward-indexed-greedy           66.14       0.80          6        19.40       0.0795         0.00       0.0004
+timing-forward-indexed-explore          91.72       1.00          5         3.00       0.1153         0.01       0.0013
+strict-outlier-indexed-explore          91.73       1.00          5         3.00       0.1074         0.01       0.0012
+fast-confidence-indexed-explore         91.73       1.00          5         3.00       0.1175         0.01       0.0011
 
 Parameter search
 
 candidate                           objective  recall@10   false+10     meanRank  uniqueWords  repeatWords
-grid-m0.55-t0.45-c20-max1200-x0.10      91.74       1.00          5         3.00         0.01       0.0003
-grid-m0.55-t0.45-c20-max750-x0.10       91.74       1.00          5         3.00         0.01       0.0003
-grid-m0.55-t0.45-c20-max900-x0.10       91.74       1.00          5         3.00         0.01       0.0003
-grid-m0.55-t0.45-c20-max1500-x0.10      91.74       1.00          5         3.00         0.01       0.0003
-grid-m0.70-t0.30-c10-max750-x0.05       91.74       1.00          5         3.00         0.01       0.0004
-grid-m0.70-t0.30-c10-max900-x0.05       91.74       1.00          5         3.00         0.01       0.0004
-grid-m0.70-t0.30-c10-max1200-x0.05      91.74       1.00          5         3.00         0.01       0.0004
-grid-m0.70-t0.30-c10-max1500-x0.05      91.74       1.00          5         3.00         0.01       0.0004
-grid-m0.60-t0.40-c20-max900-x0.05       91.74       1.00          5         3.00         0.01       0.0005
-grid-m0.60-t0.40-c20-max1200-x0.05      91.74       1.00          5         3.00         0.01       0.0005
+grid-m0.65-t0.35-c10-max900-x0.05       91.75       1.00          5         3.00         0.01       0.0002
+grid-m0.65-t0.35-c10-max1200-x0.05      91.75       1.00          5         3.00         0.01       0.0002
+grid-m0.65-t0.35-c10-max1500-x0.05      91.75       1.00          5         3.00         0.01       0.0002
+grid-m0.65-t0.35-c10-max750-x0.05       91.75       1.00          5         3.00         0.01       0.0002
+grid-m0.55-t0.45-c5-max750-x0.05        91.74       1.00          5         3.00         0.01       0.0005
+grid-m0.55-t0.45-c5-max900-x0.05        91.74       1.00          5         3.00         0.01       0.0005
+grid-m0.55-t0.45-c5-max1200-x0.05       91.74       1.00          5         3.00         0.01       0.0005
+grid-m0.55-t0.45-c5-max1500-x0.05       91.74       1.00          5         3.00         0.01       0.0005
+grid-m0.55-t0.45-c15-max750-x0.05       91.74       1.00          5         3.00         0.01       0.0006
+grid-m0.55-t0.45-c15-max1500-x0.05      91.74       1.00          5         3.00         0.01       0.0006
 
 Best candidate:
-  grid-m0.55-t0.45-c20-max1200-x0.10
-  objective=91.74 recall@10=1.00 false+10=5 meanRank=3.00 repeatWords=0.0003
+  grid-m0.65-t0.35-c10-max900-x0.05
+  objective=91.75 recall@10=1.00 false+10=5 meanRank=3.00 repeatWords=0.0002
 ```
 
 The exact numbers will vary with the seed and flags, but the main observation
@@ -350,11 +350,11 @@ Monkeytype implementation:
 
 ```text
 Suggested values to copy into Monkeytype:
-  missRateWeight = 0.55
-  timingWeight = 0.45
-  confidenceAttempts = 20
-  maxTimingMs = 1200
-  explorationRate = 0.10
+  missRateWeight = 0.65
+  timingWeight = 0.35
+  confidenceAttempts = 10
+  maxTimingMs = 900
+  explorationRate = 0.05
 ```
 
 Those are the candidate parameters from the highest-scoring grid result. The
@@ -428,7 +428,7 @@ words for one user.
 The current Monkeytype implementation should probably stay conservative:
 
 - track adjacent ASCII `a-z` bigrams first
-- ignore very small and very large timing samples
+- skip bigram updates for very small and very large timing samples
 - combine miss rate and timing penalty with a confidence ramp
 - avoid a purely greedy indexed selector
 - keep some random exploration so undiscovered weak bigrams can still surface

@@ -204,8 +204,9 @@ func TestScoreIgnoresLargeTimingOutlier(t *testing.T) {
 	// WHEN one timing sample is far above the configured timing cap.
 	updateStats(stats, "he", true, variant.MaxTimingMS+500, variant)
 
-	// THEN it should count as another attempt but not change the timing signal.
-	require.Equal(t, 31, stats["he"].Attempts)
+	// THEN the whole update should be skipped so the pause does not change the
+	// bigram history.
+	require.Equal(t, 30, stats["he"].Attempts)
 	require.Equal(t, beforeAverage, stats["he"].AverageMS)
 	require.InDelta(t, beforeScore, stats["he"].Score, 0.000001)
 }
@@ -230,13 +231,11 @@ func TestUpdateStatsOnlyUsesTimingSamplesInsideConfiguredBounds(t *testing.T) {
 	updateStats(stats, "mx", true, variant.MaxTimingMS, variant)
 	updateStats(stats, "hi", true, variant.MaxTimingMS+1, variant)
 
-	// THEN attempts still count, but only in-range timings affect AverageMS.
-	require.Equal(t, 1, stats["lo"].Attempts)
-	require.Zero(t, stats["lo"].AverageMS)
+	// THEN only in-range timings should create or update bigram histories.
+	require.Nil(t, stats["lo"])
 	require.Equal(t, variant.MinTimingMS, stats["mn"].AverageMS)
 	require.Equal(t, variant.MaxTimingMS, stats["mx"].AverageMS)
-	require.Equal(t, 1, stats["hi"].Attempts)
-	require.Zero(t, stats["hi"].AverageMS)
+	require.Nil(t, stats["hi"])
 }
 
 func TestWordScoreUsesOnlyTopThreeScoredBigrams(t *testing.T) {

@@ -322,9 +322,9 @@ Monkeytype implementation:
 Suggested values to copy into Monkeytype:
   missRateWeight = 0.55
   timingWeight = 0.45
-  confidenceAttempts = 5
+  confidenceAttempts = 20
   maxTimingMs = 1200
-  explorationRate = 0.20
+  explorationRate = 0.10
 ```
 
 Those are the candidate parameters from the highest-scoring grid result. The

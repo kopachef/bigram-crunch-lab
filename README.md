@@ -336,23 +336,28 @@ truths.
 
 There are a few important limitations to keep in mind:
 
-- This is not a full model of human typing.
-- It does not use real Monkeytype typing data.
-- The synthetic typist is only an approximation of a real user.
+- This is not a full model of human typing. It uses a synthetic typist rather
+  than real Monkeytype data, so the results should be treated as a controlled
+  approximation.
 - The default word list is small compared with real Monkeytype language files.
 - The search is a constrained grid search, not a global optimisation.
 - The objective function is hand-shaped and may need adjustment.
 - Several candidates can tie or nearly tie under the current setup.
-- A candidate that performs well here still needs manual testing in the real
-  Monkeytype UI.
 - The current algorithm only models adjacent ASCII `a-z` bigrams.
 
 ## Related Work I Looked At
 
-I came across a few papers while thinking through this. Most of them are about
-keystroke dynamics for biometrics rather than typing practice, so they do not
-directly solve this problem. Still, they helped frame why it was reasonable to
-look at timing between adjacent keys.
+The original scoring implementation lived on my own Monkeytype deployment at
+`typing.martinnn.com`. At that point it was mostly a joke version of the idea:
+I was switching keyboard layouts to Colemak, so I structured it around bigrams I
+kept mistyping and did not include timing at all.
+
+Since I am now trying to push this toward a wider audience, I wanted to revisit
+the scoring part and make it a little more considered. The scoring is a large
+part of the feature, so I figured it was worth taking a look at existing
+research around bigrams, typing behaviour, and keystroke timing. A lot of what
+I found was adjacent rather than directly applicable, but a few papers were
+still useful to think through.
 
 - Dhakal, Feit, Kristensson, and Oulasvirta, "Observations on Typing from 136
   Million Keystrokes", CHI 2018.

@@ -15,6 +15,10 @@ define some controlled word samples and typing histories, then compare a few
 scoring and selection strategies to see which ones are more likely to push known
 weak bigrams toward the top.
 
+I wrote a longer explanation of the feature, the scoring algorithm, and the
+experiments behind these values here:
+[martinnn.com/blog/bigram-crunch](https://martinnn.com/blog/bigram-crunch/).
+
 ## What I am trying to test
 
 Bigram Crunch is meant to do two related things:

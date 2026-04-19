@@ -437,7 +437,7 @@ func TestParameterSearchReturnsBestCandidatesFirst(t *testing.T) {
 
 	// GIVEN a small synthetic setup for the constrained grid search.
 	// WHEN the parameter search runs.
-	results := runParameterSearch(words, weakBigrams, 2, 20, 7, model)
+	results := runParameterSearch(words, weakBigrams, 2, 20, 7, model, SearchOptions{Workers: 1})
 
 	// THEN candidates should be returned from highest objective to lowest, with
 	// the selected parameters preserved on each result.

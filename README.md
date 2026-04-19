@@ -193,6 +193,13 @@ The largest reward is for recovering the known weak bigrams. The other terms are
 smaller penalties to avoid a top 10 full of noise, weak bigrams ranked too low,
 or a word stream that repeats too much.
 
+I also made one small practical optimisation to the experiment runner: the
+parameter search builds the word index once and then evaluates independent grid
+candidates in parallel. On my Ryzen 5950X, the same search took about `2m42s`
+with `-search-workers 1` and about `30s` with `-search-workers 32`. The best
+candidate stayed the same, so this is just a runtime improvement, not a change
+to the scoring model.
+
 This objective is deliberately simple and probably not final. It gives me a way
 to compare settings under the same assumptions. It does not prove that the top
 candidate is universally optimal.
@@ -211,11 +218,24 @@ go run . -sessions 250 -words 150 -csv results.csv
 
 By default the program also runs a constrained parameter search over indexed
 selection variants. It is meant to show which combinations performed well under
-the same synthetic setup.
+the same synthetic setup. This can take a little while, so the search prints a
+progress line like `Parameter search: 32/400 candidates using 8 workers` while
+it is running. The search candidates are independent, so the program evaluates
+them in parallel by default.
 
 ```bash
 go run . -search=true -search-top 10
 ```
+
+If you want to leave more CPU free for other work, reduce the worker count:
+
+```bash
+go run . -search-workers 2
+```
+
+For comparison, one local run took about `2m42s` with `-search-workers 1` and
+about `30s` with `-search-workers 32` on a Ryzen 5950X. Both runs selected the
+same best candidate.
 
 To only run the named hand-picked variants:
 
@@ -231,10 +251,11 @@ go run . -weak th,he,ng,mb,qu -pause-rate 0.02 -weak-miss 0.08 -weak-extra-ms 95
 
 ## Tests
 
-The real assertions are in `main_test.go` and can be run with:
+The real assertions are in `main_test.go`. I usually run them in verbose mode
+so each test name is printed on its own line:
 
 ```bash
-go test ./...
+go test -v ./...
 ```
 
 Those tests use `testify/require`. I kept each test deliberately self-contained:

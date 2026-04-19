@@ -8,22 +8,38 @@ import (
 	"math"
 	"math/rand"
 	"os"
+	"runtime"
 	"slices"
 	"strings"
+	"sync"
 )
 
+// Variant is one scoring and selection strategy being tested.
 type Variant struct {
-	Name               string
-	MissWeight         float64
-	TimingWeight       float64
+	Name string
+
+	// MissWeight and TimingWeight control the trade-off between observable
+	// mistakes and correct-but-slow transitions.
+	MissWeight   float64
+	TimingWeight float64
+
+	// ConfidenceAttempts dampens low-sample bigrams so an early mistake does not
+	// dominate the ranking forever.
 	ConfidenceAttempts int
 	TimingBaselineMS   float64
-	MinTimingMS        float64
-	MaxTimingMS        float64
-	ExplorationRate    float64
-	Selector           SelectorKind
+
+	// Timing bounds are used to drop pauses or impossible key timings before
+	// they poison a bigram's long-term average.
+	MinTimingMS float64
+	MaxTimingMS float64
+
+	// ExplorationRate keeps indexed selection from only practising the first
+	// weak bigrams it discovers.
+	ExplorationRate float64
+	Selector        SelectorKind
 }
 
+// SelectorKind changes how practice words are chosen after bigram scores exist.
 type SelectorKind string
 
 const (
@@ -32,6 +48,7 @@ const (
 	SelectorIndexed SelectorKind = "indexed"
 )
 
+// Stats is the history the scorer keeps for one bigram.
 type Stats struct {
 	Attempts  int
 	Misses    int
@@ -39,6 +56,7 @@ type Stats struct {
 	Score     float64
 }
 
+// Result is the aggregate scorecard for one variant after simulated sessions.
 type Result struct {
 	Variant          string
 	Parameters       Variant
@@ -53,6 +71,8 @@ type Result struct {
 	SelectedWordRuns int
 }
 
+// ScenarioResult is printed for human-readable sanity checks before the larger
+// aggregate simulation runs.
 type ScenarioResult struct {
 	Name        string
 	Expected    string
@@ -62,11 +82,21 @@ type ScenarioResult struct {
 	TopBigrams  []RankedBigram
 }
 
+// SearchOptions keeps test runs and CLI runs separate: tests can avoid progress
+// output or force one worker, while the CLI can use all available cores.
+type SearchOptions struct {
+	Workers      int
+	ShowProgress bool
+}
+
 type RankedBigram struct {
 	Bigram string
 	Stats
 }
 
+// TypistModel describes the synthetic user. The known weak bigrams are not used
+// by the scorer directly; they only make the simulated typist slower and less
+// accurate so we can later check whether the scorer rediscovered them.
 type TypistModel struct {
 	BaseMissRate float64
 	WeakMissRate float64
@@ -78,6 +108,11 @@ type TypistModel struct {
 	WeakBigrams  map[string]bool
 }
 
+// Simulator owns the mutable state for one run of a variant.
+//
+// WordIndex maps a bigram to words containing that bigram. RecentWords keeps the
+// selection algorithm from producing repetitive streams that look good by score
+// but would make poor practice text.
 type Simulator struct {
 	Rng           *rand.Rand
 	Words         []string
@@ -103,6 +138,7 @@ func main() {
 		runScenarios   = flag.Bool("scenarios", true, "run deterministic scenario checks before aggregate simulation")
 		runSearch      = flag.Bool("search", true, "search a constrained parameter grid and print the best configurations")
 		searchTopN     = flag.Int("search-top", 8, "number of optimisation candidates to print")
+		searchWorkers  = flag.Int("search-workers", runtime.GOMAXPROCS(0), "number of workers to use for the parameter search")
 	)
 	flag.Parse()
 
@@ -144,6 +180,9 @@ func main() {
 			PauseRate:    *pauseRate,
 			PauseMeanMS:  1800,
 			WeakBigrams:  toSet(weakBigrams),
+		}, SearchOptions{
+			Workers:      *searchWorkers,
+			ShowProgress: true,
 		})
 		printSearchResults(searchResults, *searchTopN)
 	}
@@ -156,13 +195,17 @@ func main() {
 	}
 }
 
-func runParameterSearch(words []string, weakBigrams []string, sessions, wordsPerRun int, seed int64, model TypistModel) []Result {
-	var results []Result
-
+// runParameterSearch tries a small fixed grid of parameter values. This is
+// deliberately a constrained search, not a claim that the global optimum has
+// been found.
+func runParameterSearch(words []string, weakBigrams []string, sessions, wordsPerRun int, seed int64, model TypistModel, options SearchOptions) []Result {
 	missWeights := []float64{0.45, 0.55, 0.60, 0.65, 0.70}
 	confidenceAttempts := []int{5, 10, 15, 20}
 	maxTimingValues := []float64{750, 900, 1200, 1500}
 	explorationRates := []float64{0.05, 0.10, 0.15, 0.20, 0.30}
+	totalCandidates := len(missWeights) * len(confidenceAttempts) * len(maxTimingValues) * len(explorationRates)
+
+	variants := make([]Variant, 0, totalCandidates)
 
 	for _, missWeight := range missWeights {
 		for _, confidence := range confidenceAttempts {
@@ -186,11 +229,63 @@ func runParameterSearch(words []string, weakBigrams []string, sessions, wordsPer
 						ExplorationRate:    exploration,
 						Selector:           SelectorIndexed,
 					}
-					result := runVariant(variant, words, weakBigrams, sessions, wordsPerRun, seed, model)
-					results = append(results, result)
+					variants = append(variants, variant)
 				}
 			}
 		}
+	}
+
+	workerCount := clampWorkerCount(options.Workers, totalCandidates)
+	results := make([]Result, 0, totalCandidates)
+	// The word index is read-only during simulation, so all workers can share it
+	// instead of rebuilding the same map for every candidate.
+	wordIndex := buildWordIndex(words)
+
+	if options.ShowProgress {
+		fmt.Fprintf(os.Stderr, "Parameter search: 0/%d candidates using %d workers", totalCandidates, workerCount)
+	}
+
+	// Each candidate simulation is independent. The worker pool only changes
+	// runtime; final ordering is normalised by the sort below.
+	jobs := make(chan Variant)
+	resultCh := make(chan Result)
+	var workers sync.WaitGroup
+	workers.Add(workerCount)
+	for range workerCount {
+		go func() {
+			defer workers.Done()
+			for variant := range jobs {
+				resultCh <- runVariantWithWordIndex(variant, words, weakBigrams, wordIndex, sessions, wordsPerRun, seed, model)
+			}
+		}()
+	}
+
+	go func() {
+		for _, variant := range variants {
+			jobs <- variant
+		}
+		close(jobs)
+		workers.Wait()
+		close(resultCh)
+	}()
+
+	completedCandidates := 0
+	for result := range resultCh {
+		results = append(results, result)
+		completedCandidates++
+		if options.ShowProgress {
+			fmt.Fprintf(
+				os.Stderr,
+				"\rParameter search: %d/%d candidates using %d workers (%s)",
+				completedCandidates,
+				totalCandidates,
+				workerCount,
+				result.Variant,
+			)
+		}
+	}
+	if options.ShowProgress {
+		fmt.Fprintln(os.Stderr)
 	}
 
 	slices.SortFunc(results, func(a, b Result) int {
@@ -203,7 +298,10 @@ func runParameterSearch(words []string, weakBigrams []string, sessions, wordsPer
 		if a.MeanWeakRank != b.MeanWeakRank {
 			return cmp.Compare(a.MeanWeakRank, b.MeanWeakRank)
 		}
-		return cmp.Compare(a.RepeatWordRatio, b.RepeatWordRatio)
+		if a.RepeatWordRatio != b.RepeatWordRatio {
+			return cmp.Compare(a.RepeatWordRatio, b.RepeatWordRatio)
+		}
+		return cmp.Compare(a.Variant, b.Variant)
 	})
 
 	return results
@@ -412,7 +510,15 @@ func defaultVariants() []Variant {
 	}
 }
 
+// runVariant is the convenience path used by the hand-picked variants.
 func runVariant(variant Variant, words []string, weakBigrams []string, sessions, wordsPerRun int, seed int64, model TypistModel) Result {
+	return runVariantWithWordIndex(variant, words, weakBigrams, buildWordIndex(words), sessions, wordsPerRun, seed, model)
+}
+
+// runVariantWithWordIndex runs one complete simulation for a variant. The
+// parameter search uses this lower-level form so parallel candidates can share a
+// prebuilt word index.
+func runVariantWithWordIndex(variant Variant, words []string, weakBigrams []string, wordIndex map[string][]string, sessions, wordsPerRun int, seed int64, model TypistModel) Result {
 	stats := map[string]*Stats{}
 	selectedWords := []string{}
 	rng := rand.New(rand.NewSource(seed))
@@ -420,7 +526,7 @@ func runVariant(variant Variant, words []string, weakBigrams []string, sessions,
 		Rng:           rng,
 		Words:         words,
 		WeakBigrams:   weakBigrams,
-		WordIndex:     buildWordIndex(words),
+		WordIndex:     wordIndex,
 		Model:         model,
 		WordsPerRun:   wordsPerRun,
 		RecentWordCap: 25,
@@ -441,6 +547,16 @@ func runVariant(variant Variant, words []string, weakBigrams []string, sessions,
 	return result
 }
 
+func clampWorkerCount(requested, total int) int {
+	if total <= 0 {
+		return 1
+	}
+	if requested <= 0 {
+		requested = runtime.GOMAXPROCS(0)
+	}
+	return min(requested, total)
+}
+
 func (s *Simulator) selectWord(variant Variant, stats map[string]*Stats) string {
 	switch variant.Selector {
 	case SelectorRandom:
@@ -458,6 +574,9 @@ func (s *Simulator) selectWord(variant Variant, stats map[string]*Stats) string 
 		if s.Rng.Float64() < variant.ExplorationRate {
 			return s.rememberWord(s.Words[s.Rng.Intn(len(s.Words))])
 		}
+		// Indexed selection focuses the candidate pool on words containing the
+		// current top weak bigrams. This keeps the search closer to how Bigram
+		// Crunch would generate useful practice text.
 		ranked := rankStats(stats)
 		candidateSet := map[string]bool{}
 		for _, item := range ranked[:min(10, len(ranked))] {
@@ -503,6 +622,8 @@ func (s *Simulator) pickScoredWord(candidates []string, stats map[string]*Stats)
 	}
 
 	if len(scored) == 0 {
+		// If the recent-word filter removed everything useful, retry without it.
+		// Repetition is bad, but selecting an unrelated word is worse here.
 		for _, word := range candidates {
 			score := wordScore(word, stats)
 			if score > 0 {
@@ -525,6 +646,9 @@ func (s *Simulator) pickScoredWord(candidates []string, stats map[string]*Stats)
 		scored = scored[:5]
 	}
 
+	// Pick among the best few words by score weight instead of always taking the
+	// top one. This keeps practice focused without making the stream completely
+	// deterministic.
 	total := 0.0
 	for _, candidate := range scored {
 		total += candidate.score
@@ -547,6 +671,9 @@ func (s *Simulator) rememberWord(word string) string {
 	return word
 }
 
+// typeWord turns a selected word into synthetic bigram observations. Known weak
+// bigrams are made slower and more error-prone so the later evaluation can check
+// whether the scoring algorithm finds them again.
 func (s *Simulator) typeWord(word string, stats map[string]*Stats, variant Variant) {
 	for _, bigram := range bigrams(word) {
 		isWeak := s.Model.WeakBigrams[bigram]
@@ -567,6 +694,8 @@ func (s *Simulator) typeWord(word string, stats map[string]*Stats, variant Varia
 	}
 }
 
+// updateStats applies one observation to a bigram. Samples outside the timing
+// bounds are treated as pauses/outliers and skipped completely.
 func updateStats(all map[string]*Stats, bigram string, correct bool, spacing float64, variant Variant) {
 	if spacing < variant.MinTimingMS || spacing > variant.MaxTimingMS {
 		return
@@ -587,6 +716,8 @@ func updateStats(all map[string]*Stats, bigram string, correct bool, spacing flo
 	stats.Score = score(*stats, variant)
 }
 
+// movingAverage uses a capped window so old timings decay, but not so quickly
+// that one noisy sample dominates the score.
 func movingAverage(current, next float64, previousAttempts, window int) float64 {
 	if previousAttempts == 0 || current == 0 {
 		return next
@@ -596,6 +727,8 @@ func movingAverage(current, next float64, previousAttempts, window int) float64 
 	return next*rate + current*(1-rate)
 }
 
+// score combines mistake rate, timing penalty, and confidence into one weakness
+// value. Higher means the bigram should receive more practice.
 func score(stats Stats, variant Variant) float64 {
 	if stats.Attempts == 0 {
 		return 0
@@ -606,6 +739,9 @@ func score(stats Stats, variant Variant) float64 {
 	return confidence * (missRate*variant.MissWeight + timingPenalty*variant.TimingWeight)
 }
 
+// wordScore estimates how useful a word is for practising the current weak
+// bigrams. Only the top few bigram scores count so long words do not win just
+// because they contain many mediocre pairs.
 func wordScore(word string, stats map[string]*Stats) float64 {
 	scores := []float64{}
 	for _, bigram := range bigrams(word) {
@@ -623,6 +759,8 @@ func wordScore(word string, stats map[string]*Stats) float64 {
 	return total
 }
 
+// evaluate compares the ranked output with the synthetic ground truth. The
+// simulator knows the weak bigrams, but the scorer only sees timings and misses.
 func evaluate(name string, ranked []RankedBigram, weakBigrams, selectedWords []string) Result {
 	weak := toSet(weakBigrams)
 	topN := ranked[:min(10, len(ranked))]
@@ -713,6 +851,8 @@ func bigrams(word string) []string {
 	return out
 }
 
+// buildWordIndex is the lookup used by indexed selection: given a weak bigram,
+// find practice words that contain it.
 func buildWordIndex(words []string) map[string][]string {
 	index := map[string][]string{}
 	for _, word := range words {

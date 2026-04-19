@@ -30,6 +30,14 @@ The second point is important because otherwise the feature becomes too similar
 to a normal weak-spot/mistake mode. I wanted the algorithm to pick up cases
 where a pair is technically correct, but still slows the typist down.
 
+Monkeytype's existing Weakspot mode is the closest comparison here. My
+understanding is that Weakspot tracks weak individual characters using timing
+and mistakes. Bigram Crunch is deliberately narrower: it tracks adjacent
+character transitions. So if `g` is awkward only after some previous letters,
+Weakspot can learn that `g` is weak, but it will not separate `ng`, `eg`, and
+`ag`. Bigram Crunch can let those pairs settle into different scores if the
+typing history shows that the transitions are not equally easy.
+
 The simulation gives a synthetic typist a few known weak bigrams, for example
 `th`, `he`, `ng`, `mb`, and `qu`. Those bigrams are given a higher miss rate
 and an extra timing delay. The program then compares scoring variants and checks

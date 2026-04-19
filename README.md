@@ -114,6 +114,15 @@ The confidence term is there because I do not want one early mistake to dominate
 the ranking forever. The score is allowed to ramp up as the bigram gets enough
 attempts to be more meaningful.
 
+The Monkeytype implementation now uses an adaptive timing baseline rather than
+a single fixed number. I noticed while testing locally that a fixed `180ms`
+baseline was too high for many ordinary correct bigrams on my setup, which made
+their timing penalty stay at zero even when some pairs were clearly slower than
+the rest. The current implementation starts with a `120ms` fallback baseline,
+then after `150` timing samples it uses the recent average timing, clamped
+between `50ms` and `180ms`. That keeps the timing score relative to the current
+typist instead of assuming one global speed.
+
 Timing samples below `minTimingMS` or above `maxTimingMS` are treated as
 outliers, and the whole bigram update is skipped. The reason for this is
 practical rather than theoretical: very small timings and large pauses usually
@@ -156,11 +165,27 @@ maxTimingMS
 explorationRate
 ```
 
+After that first pass, the lab runs a second, narrower search for the adaptive
+timing baseline values:
+
+```text
+fallbackTimingBaselineMS
+adaptiveTimingMinSamples
+minAdaptiveTimingBaselineMS
+maxAdaptiveTimingBaselineMS
+timingBaselineWindow
+```
+
+That second search keeps the best miss/timing weights fixed. I split it out
+because searching everything at once makes the grid much larger, and because
+the adaptive baseline is trying to answer a slightly different question: what
+should count as normal timing for the current typist?
+
 For each combination, the program runs the same synthetic typing setup and
 computes an objective score. A candidate name like this:
 
 ```text
-grid-m0.65-t0.35-c10-max900-x0.05
+grid-m0.65-t0.35-c10-max1200-x0.05
 ```
 
 means:
@@ -169,7 +194,7 @@ means:
 missWeight = 0.65
 timingWeight = 0.35
 confidenceAttempts = 10
-maxTimingMS = 900
+maxTimingMS = 1200
 explorationRate = 0.05
 ```
 
@@ -276,6 +301,12 @@ The current assertion tests cover:
 - confidence should ramp scores up as attempts accumulate
 - scoring weights should control whether misses or timing dominate
 - a slow-but-correct bigram should move to the top
+- the adaptive timing baseline should use its fallback until enough samples are
+  collected
+- the adaptive timing baseline should expose slow correct bigrams for faster
+  typists
+- the adaptive timing baseline should clamp very fast or very slow recent
+  averages
 - a large timing outlier should not change the bigram history
 - timing samples should only update histories inside the configured bounds
 - word scores should use only the top three scored bigrams in a word
@@ -286,6 +317,7 @@ The current assertion tests cover:
 - the objective should reward recall and penalise noise, rank, and repetition
 - indexed selection needs some exploration to avoid getting stuck
 - parameter search should return the highest-objective candidates first
+- adaptive timing search should return the highest-objective candidates first
 
 The program also runs a few deterministic scenario checks by default. These are
 small hand-shaped cases that helped me check the assumptions before looking at
@@ -349,20 +381,38 @@ fast-confidence-indexed-explore         91.73       1.00          5         3.00
 Parameter search
 
 candidate                           objective  recall@10   false+10     meanRank  uniqueWords  repeatWords
-grid-m0.65-t0.35-c10-max900-x0.05       91.75       1.00          5         3.00         0.01       0.0002
 grid-m0.65-t0.35-c10-max1200-x0.05      91.75       1.00          5         3.00         0.01       0.0002
 grid-m0.65-t0.35-c10-max1500-x0.05      91.75       1.00          5         3.00         0.01       0.0002
 grid-m0.65-t0.35-c10-max750-x0.05       91.75       1.00          5         3.00         0.01       0.0002
-grid-m0.55-t0.45-c5-max750-x0.05        91.74       1.00          5         3.00         0.01       0.0005
-grid-m0.55-t0.45-c5-max900-x0.05        91.74       1.00          5         3.00         0.01       0.0005
+grid-m0.65-t0.35-c10-max900-x0.05       91.75       1.00          5         3.00         0.01       0.0002
 grid-m0.55-t0.45-c5-max1200-x0.05       91.74       1.00          5         3.00         0.01       0.0005
 grid-m0.55-t0.45-c5-max1500-x0.05       91.74       1.00          5         3.00         0.01       0.0005
-grid-m0.55-t0.45-c15-max750-x0.05       91.74       1.00          5         3.00         0.01       0.0006
-grid-m0.55-t0.45-c15-max1500-x0.05      91.74       1.00          5         3.00         0.01       0.0006
+grid-m0.55-t0.45-c5-max750-x0.05        91.74       1.00          5         3.00         0.01       0.0005
+grid-m0.55-t0.45-c5-max900-x0.05        91.74       1.00          5         3.00         0.01       0.0005
+grid-m0.45-t0.55-c20-max1200-x0.05      91.74       1.00          5         3.00         0.01       0.0006
+grid-m0.45-t0.55-c20-max1500-x0.05      91.74       1.00          5         3.00         0.01       0.0006
 
 Best candidate:
-  grid-m0.65-t0.35-c10-max900-x0.05
+  grid-m0.65-t0.35-c10-max1200-x0.05
   objective=91.75 recall@10=1.00 false+10=5 meanRank=3.00 repeatWords=0.0002
+
+Adaptive timing baseline search
+
+candidate                                   objective  recall@10   false+10     meanRank  uniqueWords  repeatWords
+adaptive-f120-s150-min50-max180-w200            91.74       1.00          5         3.00         0.01       0.0003
+adaptive-f120-s150-min50-max220-w200            91.74       1.00          5         3.00         0.01       0.0003
+adaptive-f120-s150-min60-max180-w200            91.74       1.00          5         3.00         0.01       0.0003
+adaptive-f120-s150-min60-max220-w200            91.74       1.00          5         3.00         0.01       0.0003
+adaptive-f120-s150-min70-max180-w200            91.74       1.00          5         3.00         0.01       0.0003
+adaptive-f120-s150-min70-max220-w200            91.74       1.00          5         3.00         0.01       0.0003
+adaptive-f100-s50-min50-max180-w200             91.74       1.00          5         3.00         0.01       0.0003
+adaptive-f100-s50-min50-max220-w200             91.74       1.00          5         3.00         0.01       0.0003
+adaptive-f100-s50-min60-max180-w200             91.74       1.00          5         3.00         0.01       0.0003
+adaptive-f100-s50-min60-max220-w200             91.74       1.00          5         3.00         0.01       0.0003
+
+Best adaptive timing candidate:
+  adaptive-f120-s150-min50-max180-w200
+  objective=91.74 recall@10=1.00 false+10=5 meanRank=3.00 repeatWords=0.0003
 ```
 
 The exact numbers will vary with the seed and flags, but the main observation
@@ -382,7 +432,7 @@ Suggested values to copy into Monkeytype:
   missRateWeight = 0.65
   timingWeight = 0.35
   confidenceAttempts = 10
-  maxTimingMs = 900
+  maxTimingMs = 1200
   explorationRate = 0.05
 ```
 
@@ -390,6 +440,23 @@ Those are the candidate parameters from the highest-scoring grid result. The
 exact numbers can change when the seed, synthetic typing model, or search ranges
 change, so I would treat them as tuned starting values rather than permanent
 truths.
+
+The adaptive timing search also prints values that can be copied into
+Monkeytype:
+
+```text
+Suggested adaptive timing values to copy into Monkeytype:
+fallbackTimingBaselineMs = 120
+adaptiveTimingMinSamples = 150
+minAdaptiveTimingBaselineMs = 50
+maxAdaptiveTimingBaselineMs = 180
+timingBaselineWindow = 200
+```
+
+I would not read that as a uniquely proven optimum. Several adaptive candidates
+landed in the same small cluster, including the more conservative
+The useful result is that the adaptive baseline direction holds up under the
+same simulation; the exact constants are still tuned starting values.
 
 ## Limitations
 

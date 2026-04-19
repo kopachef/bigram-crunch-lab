@@ -181,6 +181,102 @@ func TestScorePromotesSlowButCorrectBigram(t *testing.T) {
 	require.Greater(t, ranked[0].Score, ranked[1].Score)
 }
 
+func TestAdaptiveTimingBaselineUsesFallbackUntilEnoughSamples(t *testing.T) {
+	variant := Variant{
+		MissWeight:                0.65,
+		TimingWeight:              0.35,
+		ConfidenceAttempts:        10,
+		TimingBaselineMS:          180,
+		FallbackTimingBaselineMS:  100,
+		MinTimingMS:               20,
+		MaxTimingMS:               1200,
+		AdaptiveTimingMinSamples:  3,
+		MinAdaptiveTimingBaseline: 60,
+		MaxAdaptiveTimingBaseline: 180,
+		TimingBaselineWindow:      10,
+		ExplorationRate:           0.05,
+		Selector:                  SelectorIndexed,
+	}
+	timingBaseline := &TimingBaseline{}
+
+	// GIVEN adaptive timing has not collected enough global samples.
+	updateTimingBaseline(timingBaseline, 80, variant)
+	updateTimingBaseline(timingBaseline, 80, variant)
+
+	// WHEN the active baseline is requested.
+	activeBaseline := activeTimingBaseline(variant, timingBaseline)
+
+	// THEN the scorer should still use the fallback value.
+	require.Equal(t, 2, timingBaseline.Samples)
+	require.InDelta(t, 100.0, activeBaseline, 0.000001)
+}
+
+func TestAdaptiveTimingBaselineCanExposeSlowCorrectBigrams(t *testing.T) {
+	variant := Variant{
+		MissWeight:                0,
+		TimingWeight:              1,
+		ConfidenceAttempts:        1,
+		TimingBaselineMS:          180,
+		FallbackTimingBaselineMS:  100,
+		MinTimingMS:               20,
+		MaxTimingMS:               1200,
+		AdaptiveTimingMinSamples:  3,
+		MinAdaptiveTimingBaseline: 60,
+		MaxAdaptiveTimingBaseline: 180,
+		TimingBaselineWindow:      10,
+		ExplorationRate:           0.05,
+		Selector:                  SelectorIndexed,
+	}
+	stats := map[string]*Stats{}
+	timingBaseline := &TimingBaseline{}
+
+	// GIVEN the typist's recent global timing baseline is faster than the old
+	// fixed 180ms value.
+	for range 5 {
+		updateStats(stats, "th", true, 80, variant, timingBaseline)
+	}
+
+	// WHEN a correct bigram is consistently slower than that adaptive baseline.
+	for range 5 {
+		updateStats(stats, "mb", true, 150, variant, timingBaseline)
+	}
+
+	// THEN timing alone should give that slow pair a positive score, even though
+	// it has no misses.
+	require.Greater(t, stats["mb"].Score, 0.0)
+	require.Greater(t, stats["mb"].Score, stats["th"].Score)
+	require.Less(t, activeTimingBaseline(variant, timingBaseline), variant.TimingBaselineMS)
+}
+
+func TestAdaptiveTimingBaselineClampsRecentAverage(t *testing.T) {
+	variant := Variant{
+		MissWeight:                0.65,
+		TimingWeight:              0.35,
+		ConfidenceAttempts:        10,
+		TimingBaselineMS:          180,
+		FallbackTimingBaselineMS:  100,
+		MinTimingMS:               20,
+		MaxTimingMS:               1200,
+		AdaptiveTimingMinSamples:  1,
+		MinAdaptiveTimingBaseline: 60,
+		MaxAdaptiveTimingBaseline: 180,
+		TimingBaselineWindow:      10,
+		ExplorationRate:           0.05,
+		Selector:                  SelectorIndexed,
+	}
+	fastBaseline := &TimingBaseline{AverageMS: 30, Samples: 10}
+	slowBaseline := &TimingBaseline{AverageMS: 260, Samples: 10}
+
+	// GIVEN recent averages outside the accepted adaptive baseline range.
+	// WHEN the active baselines are calculated.
+	fastActive := activeTimingBaseline(variant, fastBaseline)
+	slowActive := activeTimingBaseline(variant, slowBaseline)
+
+	// THEN the scorer should keep the comparison point within sane bounds.
+	require.InDelta(t, 60.0, fastActive, 0.000001)
+	require.InDelta(t, 180.0, slowActive, 0.000001)
+}
+
 func TestScoreIgnoresLargeTimingOutlier(t *testing.T) {
 	variant := Variant{
 		MissWeight:         0.55,
@@ -448,4 +544,51 @@ func TestParameterSearchReturnsBestCandidatesFirst(t *testing.T) {
 	require.Equal(t, SelectorIndexed, results[0].Parameters.Selector)
 	require.Equal(t, results[0].Variant, results[0].Parameters.Name)
 	require.Contains(t, results[0].Variant, "grid-")
+}
+
+func TestAdaptiveTimingSearchReturnsBestCandidatesFirst(t *testing.T) {
+	words := []string{
+		"thing", "other", "bring", "strong", "bemba", "mumba", "quick", "quiet",
+		"plain", "table", "later", "sound",
+	}
+	weakBigrams := []string{"th", "ng", "mb", "qu"}
+	model := TypistModel{
+		BaseMissRate: 0.006,
+		WeakMissRate: 0.08,
+		BaseMeanMS:   145,
+		BaseStdMS:    35,
+		WeakExtraMS:  95,
+		PauseRate:    0.01,
+		PauseMeanMS:  1800,
+		WeakBigrams:  toSet(weakBigrams),
+	}
+	base := Variant{
+		Name:               "base",
+		MissWeight:         0.65,
+		TimingWeight:       0.35,
+		ConfidenceAttempts: 10,
+		TimingBaselineMS:   180,
+		MinTimingMS:        20,
+		MaxTimingMS:        1200,
+		ExplorationRate:    0.05,
+		Selector:           SelectorIndexed,
+	}
+
+	// GIVEN a fixed scoring configuration and a constrained adaptive-baseline
+	// grid.
+	// WHEN the adaptive timing search runs.
+	results := runAdaptiveTimingSearch(base, words, weakBigrams, 2, 20, 7, model, SearchOptions{Workers: 1})
+
+	// THEN candidates should be returned from highest objective to lowest, and
+	// the chosen adaptive values should be preserved on the result.
+	require.Len(t, results, 243)
+	for index := 1; index < len(results); index++ {
+		require.LessOrEqual(t, results[index].Objective, results[index-1].Objective)
+	}
+	require.Equal(t, SelectorIndexed, results[0].Parameters.Selector)
+	require.Equal(t, results[0].Variant, results[0].Parameters.Name)
+	require.Contains(t, results[0].Variant, "adaptive-")
+	require.Positive(t, results[0].Parameters.FallbackTimingBaselineMS)
+	require.Positive(t, results[0].Parameters.AdaptiveTimingMinSamples)
+	require.Positive(t, results[0].Parameters.TimingBaselineWindow)
 }

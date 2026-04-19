@@ -26,12 +26,24 @@ type Variant struct {
 	// ConfidenceAttempts dampens low-sample bigrams so an early mistake does not
 	// dominate the ranking forever.
 	ConfidenceAttempts int
-	TimingBaselineMS   float64
+
+	// TimingBaselineMS is the fixed timing baseline. When adaptive timing is
+	// enabled, FallbackTimingBaselineMS is used until enough timing samples exist.
+	TimingBaselineMS         float64
+	FallbackTimingBaselineMS float64
 
 	// Timing bounds are used to drop pauses or impossible key timings before
 	// they poison a bigram's long-term average.
 	MinTimingMS float64
 	MaxTimingMS float64
+
+	// Adaptive timing compares each bigram against the typist's recent global
+	// timing average. This is intentionally global rather than per-language so
+	// the feature stays small and reacts to the current user/session.
+	AdaptiveTimingMinSamples  int
+	MinAdaptiveTimingBaseline float64
+	MaxAdaptiveTimingBaseline float64
+	TimingBaselineWindow      int
 
 	// ExplorationRate keeps indexed selection from only practising the first
 	// weak bigrams it discovers.
@@ -54,6 +66,14 @@ type Stats struct {
 	Misses    int
 	AverageMS float64
 	Score     float64
+}
+
+// TimingBaseline tracks the user's recent key-to-key timing across all bigrams.
+// Individual bigrams still keep their own averages; this baseline is only the
+// "normal for this typist right now" comparison point.
+type TimingBaseline struct {
+	AverageMS float64
+	Samples   int
 }
 
 // Result is the aggregate scorecard for one variant after simulated sessions.
@@ -114,14 +134,15 @@ type TypistModel struct {
 // selection algorithm from producing repetitive streams that look good by score
 // but would make poor practice text.
 type Simulator struct {
-	Rng           *rand.Rand
-	Words         []string
-	WeakBigrams   []string
-	WordIndex     map[string][]string
-	Model         TypistModel
-	WordsPerRun   int
-	RecentWords   []string
-	RecentWordCap int
+	Rng            *rand.Rand
+	Words          []string
+	WeakBigrams    []string
+	WordIndex      map[string][]string
+	Model          TypistModel
+	WordsPerRun    int
+	RecentWords    []string
+	RecentWordCap  int
+	TimingBaseline TimingBaseline
 }
 
 func main() {
@@ -185,6 +206,24 @@ func main() {
 			ShowProgress: true,
 		})
 		printSearchResults(searchResults, *searchTopN)
+
+		if len(searchResults) > 0 {
+			fmt.Println()
+			adaptiveResults := runAdaptiveTimingSearch(searchResults[0].Parameters, words, weakBigrams, *sessions, *wordsPerRun, *seed, TypistModel{
+				BaseMissRate: 0.006,
+				WeakMissRate: *weakMissRate,
+				BaseMeanMS:   145,
+				BaseStdMS:    35,
+				WeakExtraMS:  *weakExtraMS,
+				PauseRate:    *pauseRate,
+				PauseMeanMS:  1800,
+				WeakBigrams:  toSet(weakBigrams),
+			}, SearchOptions{
+				Workers:      *searchWorkers,
+				ShowProgress: true,
+			})
+			printAdaptiveTimingSearchResults(adaptiveResults, *searchTopN)
+		}
 	}
 
 	if *outputCSV != "" {
@@ -235,6 +274,56 @@ func runParameterSearch(words []string, weakBigrams []string, sessions, wordsPer
 		}
 	}
 
+	return runSearchCandidates("Parameter search", variants, words, weakBigrams, sessions, wordsPerRun, seed, model, options)
+}
+
+// runAdaptiveTimingSearch keeps the winning miss/timing weights fixed and
+// searches the adaptive timing baseline values separately. This avoids exploding
+// the main parameter grid while still giving the adaptive constants an evidence
+// trail.
+func runAdaptiveTimingSearch(base Variant, words []string, weakBigrams []string, sessions, wordsPerRun int, seed int64, model TypistModel, options SearchOptions) []Result {
+	fallbackBaselines := []float64{80, 100, 120}
+	minSamples := []int{50, 100, 150}
+	minBaselines := []float64{50, 60, 70}
+	maxBaselines := []float64{150, 180, 220}
+	windows := []int{100, 200, 300}
+	totalCandidates := len(fallbackBaselines) * len(minSamples) * len(minBaselines) * len(maxBaselines) * len(windows)
+
+	variants := make([]Variant, 0, totalCandidates)
+	for _, fallback := range fallbackBaselines {
+		for _, samples := range minSamples {
+			for _, minBaseline := range minBaselines {
+				for _, maxBaseline := range maxBaselines {
+					if minBaseline >= maxBaseline {
+						continue
+					}
+					for _, window := range windows {
+						variant := base
+						variant.Name = fmt.Sprintf(
+							"adaptive-f%.0f-s%d-min%.0f-max%.0f-w%d",
+							fallback,
+							samples,
+							minBaseline,
+							maxBaseline,
+							window,
+						)
+						variant.FallbackTimingBaselineMS = fallback
+						variant.AdaptiveTimingMinSamples = samples
+						variant.MinAdaptiveTimingBaseline = minBaseline
+						variant.MaxAdaptiveTimingBaseline = maxBaseline
+						variant.TimingBaselineWindow = window
+						variants = append(variants, variant)
+					}
+				}
+			}
+		}
+	}
+
+	return runSearchCandidates("Adaptive timing search", variants, words, weakBigrams, sessions, wordsPerRun, seed, model, options)
+}
+
+func runSearchCandidates(label string, variants []Variant, words []string, weakBigrams []string, sessions, wordsPerRun int, seed int64, model TypistModel, options SearchOptions) []Result {
+	totalCandidates := len(variants)
 	workerCount := clampWorkerCount(options.Workers, totalCandidates)
 	results := make([]Result, 0, totalCandidates)
 	// The word index is read-only during simulation, so all workers can share it
@@ -242,7 +331,7 @@ func runParameterSearch(words []string, weakBigrams []string, sessions, wordsPer
 	wordIndex := buildWordIndex(words)
 
 	if options.ShowProgress {
-		fmt.Fprintf(os.Stderr, "Parameter search: 0/%d candidates using %d workers", totalCandidates, workerCount)
+		fmt.Fprintf(os.Stderr, "%s: 0/%d candidates using %d workers", label, totalCandidates, workerCount)
 	}
 
 	// Each candidate simulation is independent. The worker pool only changes
@@ -276,7 +365,8 @@ func runParameterSearch(words []string, weakBigrams []string, sessions, wordsPer
 		if options.ShowProgress {
 			fmt.Fprintf(
 				os.Stderr,
-				"\rParameter search: %d/%d candidates using %d workers (%s)",
+				"\r%s: %d/%d candidates using %d workers (%s)",
+				label,
 				completedCandidates,
 				totalCandidates,
 				workerCount,
@@ -690,16 +780,19 @@ func (s *Simulator) typeWord(word string, stats map[string]*Stats, variant Varia
 			spacing += s.Model.PauseMeanMS
 		}
 
-		updateStats(stats, bigram, !missed, spacing, variant)
+		updateStats(stats, bigram, !missed, spacing, variant, &s.TimingBaseline)
 	}
 }
 
 // updateStats applies one observation to a bigram. Samples outside the timing
 // bounds are treated as pauses/outliers and skipped completely.
-func updateStats(all map[string]*Stats, bigram string, correct bool, spacing float64, variant Variant) {
+func updateStats(all map[string]*Stats, bigram string, correct bool, spacing float64, variant Variant, baselines ...*TimingBaseline) {
 	if spacing < variant.MinTimingMS || spacing > variant.MaxTimingMS {
 		return
 	}
+
+	timingBaseline := optionalTimingBaseline(baselines)
+	updateTimingBaseline(timingBaseline, spacing, variant)
 
 	stats := all[bigram]
 	if stats == nil {
@@ -713,7 +806,35 @@ func updateStats(all map[string]*Stats, bigram string, correct bool, spacing flo
 		stats.Misses++
 	}
 	stats.AverageMS = movingAverage(stats.AverageMS, spacing, previousAttempts, 50)
-	stats.Score = score(*stats, variant)
+	refreshScores(all, variant, timingBaseline)
+}
+
+func optionalTimingBaseline(baselines []*TimingBaseline) *TimingBaseline {
+	if len(baselines) == 0 {
+		return nil
+	}
+	return baselines[0]
+}
+
+func updateTimingBaseline(timingBaseline *TimingBaseline, spacing float64, variant Variant) {
+	if timingBaseline == nil || !variant.usesAdaptiveTiming() {
+		return
+	}
+
+	timingBaseline.AverageMS = movingAverage(
+		timingBaseline.AverageMS,
+		spacing,
+		timingBaseline.Samples,
+		variant.TimingBaselineWindow,
+	)
+	timingBaseline.Samples++
+}
+
+func refreshScores(all map[string]*Stats, variant Variant, timingBaseline *TimingBaseline) {
+	activeTimingBaselineMS := activeTimingBaseline(variant, timingBaseline)
+	for _, stats := range all {
+		stats.Score = scoreWithBaseline(*stats, variant, activeTimingBaselineMS)
+	}
 }
 
 // movingAverage uses a capped window so old timings decay, but not so quickly
@@ -727,14 +848,46 @@ func movingAverage(current, next float64, previousAttempts, window int) float64 
 	return next*rate + current*(1-rate)
 }
 
+func (variant Variant) usesAdaptiveTiming() bool {
+	return variant.AdaptiveTimingMinSamples > 0 &&
+		variant.FallbackTimingBaselineMS > 0 &&
+		variant.MinAdaptiveTimingBaseline > 0 &&
+		variant.MaxAdaptiveTimingBaseline > 0 &&
+		variant.TimingBaselineWindow > 0
+}
+
+func activeTimingBaseline(variant Variant, timingBaseline *TimingBaseline) float64 {
+	fallback := variant.TimingBaselineMS
+	if variant.FallbackTimingBaselineMS > 0 {
+		fallback = variant.FallbackTimingBaselineMS
+	}
+	if fallback <= 0 {
+		fallback = 180
+	}
+
+	if timingBaseline == nil || !variant.usesAdaptiveTiming() || timingBaseline.Samples < variant.AdaptiveTimingMinSamples {
+		return fallback
+	}
+
+	return clamp(
+		timingBaseline.AverageMS,
+		variant.MinAdaptiveTimingBaseline,
+		variant.MaxAdaptiveTimingBaseline,
+	)
+}
+
 // score combines mistake rate, timing penalty, and confidence into one weakness
 // value. Higher means the bigram should receive more practice.
 func score(stats Stats, variant Variant) float64 {
+	return scoreWithBaseline(stats, variant, activeTimingBaseline(variant, nil))
+}
+
+func scoreWithBaseline(stats Stats, variant Variant, timingBaselineMS float64) float64 {
 	if stats.Attempts == 0 {
 		return 0
 	}
 	missRate := float64(stats.Misses) / float64(stats.Attempts)
-	timingPenalty := clamp((stats.AverageMS-variant.TimingBaselineMS)/variant.TimingBaselineMS, 0, 2)
+	timingPenalty := clamp((stats.AverageMS-timingBaselineMS)/timingBaselineMS, 0, 2)
 	confidence := min(1, float64(stats.Attempts)/float64(variant.ConfidenceAttempts))
 	return confidence * (missRate*variant.MissWeight + timingPenalty*variant.TimingWeight)
 }
@@ -990,6 +1143,48 @@ func printSearchResults(results []Result, topN int) {
 	fmt.Printf("  confidenceAttempts = %d\n", best.Parameters.ConfidenceAttempts)
 	fmt.Printf("  maxTimingMs = %.0f\n", best.Parameters.MaxTimingMS)
 	fmt.Printf("  explorationRate = %.2f\n", best.Parameters.ExplorationRate)
+}
+
+func printAdaptiveTimingSearchResults(results []Result, topN int) {
+	if len(results) == 0 {
+		return
+	}
+
+	fmt.Println("Adaptive timing baseline search")
+	fmt.Println()
+	fmt.Println("This keeps the best scoring weights fixed and searches the global timing baseline values used to compare each bigram against the current typist.")
+	fmt.Println()
+	fmt.Printf("%-42s %10s %10s %10s %12s %12s %12s\n", "candidate", "objective", "recall@10", "false+10", "meanRank", "uniqueWords", "repeatWords")
+	for _, result := range results[:min(topN, len(results))] {
+		fmt.Printf("%-42s %10.2f %10.2f %10d %12.2f %12.2f %12.4f\n",
+			result.Variant,
+			result.Objective,
+			result.RecallAt10,
+			result.FalsePositive10,
+			result.MeanWeakRank,
+			result.UniqueWordRatio,
+			result.RepeatWordRatio,
+		)
+	}
+
+	best := results[0]
+	fmt.Println()
+	fmt.Println("Best adaptive timing candidate:")
+	fmt.Printf("  %s\n", best.Variant)
+	fmt.Printf("  objective=%.2f recall@10=%.2f false+10=%d meanRank=%.2f repeatWords=%.4f\n",
+		best.Objective,
+		best.RecallAt10,
+		best.FalsePositive10,
+		best.MeanWeakRank,
+		best.RepeatWordRatio,
+	)
+	fmt.Println()
+	fmt.Println("Suggested adaptive timing values to copy into Monkeytype:")
+	fmt.Printf("  fallbackTimingBaselineMs = %.0f\n", best.Parameters.FallbackTimingBaselineMS)
+	fmt.Printf("  adaptiveTimingMinSamples = %d\n", best.Parameters.AdaptiveTimingMinSamples)
+	fmt.Printf("  minAdaptiveTimingBaselineMs = %.0f\n", best.Parameters.MinAdaptiveTimingBaseline)
+	fmt.Printf("  maxAdaptiveTimingBaselineMs = %.0f\n", best.Parameters.MaxAdaptiveTimingBaseline)
+	fmt.Printf("  timingBaselineWindow = %d\n", best.Parameters.TimingBaselineWindow)
 }
 
 func writeCSV(path string, results []Result) error {
